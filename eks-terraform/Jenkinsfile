@@ -1,0 +1,153 @@
+pipeline {
+    agent any
+
+    parameters {
+        booleanParam(
+            name: 'DESTROY_INFRA',
+            defaultValue: false,
+            description: ' Destroy ALL Terraform-managed infrastructure (EKS, VPC, etc.)'
+        )
+    }
+
+    environment {
+        AWS_REGION = 'us-east-1'
+        DOCKERHUB_USERNAME = 'your_dockerhub_username'
+        BACKEND_IMAGE = 'react-todo-backend'
+        FRONTEND_IMAGE = 'react-todo-frontend'
+    }
+
+    stages {
+
+        stage('Checkout Code') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Terraform Init & Apply (EKS)') {
+            when {
+                expression { params.DESTROY_INFRA == false }
+            }
+            steps {
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: 'aws-credentials']
+                ]) {
+                    dir('terraform/eks') {
+                        sh '''
+                          terraform init
+                          terraform validate
+                          terraform apply -auto-approve
+                        '''
+                    }
+                }
+            }
+        }
+
+        stage('Configure AWS & EKS') {
+            when {
+                expression { params.DESTROY_INFRA == false }
+            }
+            steps {
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: 'aws-credentials']
+                ]) {
+                    sh '''
+                      aws eks update-kubeconfig \
+                        --region $AWS_REGION \
+                        --name my-cluster
+                    '''
+                }
+            }
+        }
+
+        stage('Docker Login') {
+            when {
+                expression { params.DESTROY_INFRA == false }
+            }
+            steps {
+                withCredentials([
+                    usernamePassword(
+                        credentialsId: 'dockerhub-credentials',
+                        usernameVariable: 'DOCKER_USER',
+                        passwordVariable: 'DOCKER_PASS'
+                    )
+                ]) {
+                    sh '''
+                      echo "$DOCKER_PASS" | docker login -u "$DOCKER_USER" --password-stdin
+                    '''
+                }
+            }
+        }
+
+        stage('Build Docker Images') {
+            when {
+                expression { params.DESTROY_INFRA == false }
+            }
+            steps {
+                sh '''
+                  docker build -t $DOCKERHUB_USERNAME/$BACKEND_IMAGE:latest backend
+                  docker build -t $DOCKERHUB_USERNAME/$FRONTEND_IMAGE:latest frontend
+                '''
+            }
+        }
+
+        stage('Push Docker Images') {
+            when {
+                expression { params.DESTROY_INFRA == false }
+            }
+            steps {
+                sh '''
+                  docker push $DOCKERHUB_USERNAME/$BACKEND_IMAGE:latest
+                  docker push $DOCKERHUB_USERNAME/$FRONTEND_IMAGE:latest
+                '''
+            }
+        }
+
+        stage('Deploy to EKS') {
+            when {
+                expression { params.DESTROY_INFRA == false }
+            }
+            steps {
+                sh '''
+                  kubectl apply -f k8s/
+                '''
+            }
+        }
+
+        /* ===============================
+           DESTROY STAGE (MANUAL)
+           =============================== */
+        stage('Terraform Destroy (EKS & Infra)') {
+            when {
+                expression { params.DESTROY_INFRA == true }
+            }
+            steps {
+                withCredentials([
+                    [$class: 'AmazonWebServicesCredentialsBinding',
+                     credentialsId: 'aws-credentials']
+                ]) {
+                    dir('terraform/eks') {
+                        sh '''
+                          terraform init
+                          terraform destroy -auto-approve
+                        '''
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        always {
+            sh 'docker logout || true'
+        }
+        failure {
+            echo ' Pipeline failed!'
+        }
+        success {
+            echo ' Pipeline completed successfully!'
+        }
+    }
+}
